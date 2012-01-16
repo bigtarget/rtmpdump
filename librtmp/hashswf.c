@@ -528,7 +528,7 @@ RTMP_HashSWF(const char *url, unsigned int *size, unsigned char *hash,
 
 	  if (strncmp(buf, "url: ", 5))
 	    continue;
-	  if (strncmp(buf + 5, url, hlen))
+	  if (strncmp(buf + 5, url, strlen(url)))
 	    continue;
 	  r1 = strrchr(buf, '/');
 	  i = strlen(r1);

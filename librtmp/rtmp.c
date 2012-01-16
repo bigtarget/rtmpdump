@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 #include "rtmp_sys.h"
 #include "log.h"
@@ -45,6 +46,7 @@ TLS_CTX RTMP_TLS_ctx;
 
 #define RTMP_SIG_SIZE 1536
 #define RTMP_LARGE_HEADER_SIZE 12
+#define HEX2BIN(a) (((a)&0x40)?((a)&0xf)+9:((a)&0xf))
 
 static const int packetSize[] = { 12, 8, 4, 1 };
 
@@ -97,6 +99,7 @@ static int SendFCSubscribe(RTMP *r, AVal *subscribepath);
 static int SendPlay(RTMP *r);
 static int SendBytesReceived(RTMP *r);
 static int SendUsherToken(RTMP *r, AVal *usherToken);
+static int SendCustomCommand(RTMP *r, AVal *Command);
 
 #if 0				/* unused */
 static int SendBGHasStream(RTMP *r, double dId, AVal *playpath);
@@ -337,6 +340,7 @@ RTMP_SetupStream(RTMP *r,
 		 AVal *flashVer,
 		 AVal *subscribepath,
 		 AVal *usherToken,
+		 AVal *WeebTicket,
 		 int dStart,
 		 int dStop, int bLiveStream, long int timeout)
 {
@@ -359,6 +363,8 @@ RTMP_SetupStream(RTMP *r,
     RTMP_Log(RTMP_LOGDEBUG, "subscribepath : %s", subscribepath->av_val);
   if (usherToken && usherToken->av_val)
     RTMP_Log(RTMP_LOGDEBUG, "NetStream.Authenticate.UsherToken : %s", usherToken->av_val);
+  if (WeebTicket && WeebTicket->av_val)
+    RTMP_Log(RTMP_LOGDEBUG, "WeebTkt  : %s", WeebTicket->av_val);
   if (flashVer && flashVer->av_val)
     RTMP_Log(RTMP_LOGDEBUG, "flashVer : %s", flashVer->av_val);
   if (dStart > 0)
@@ -426,6 +432,8 @@ RTMP_SetupStream(RTMP *r,
     r->Link.subscribepath = *subscribepath;
   if (usherToken && usherToken->av_len)
     r->Link.usherToken = *usherToken;
+  if (WeebTicket && WeebTicket->av_len)
+    r->Link.WeebTicket = *WeebTicket;
   r->Link.seekTime = dStart;
   r->Link.stopTime = dStop;
   if (bLiveStream)
@@ -483,14 +491,22 @@ static struct urlopt {
   	"Stream is live, no seeking possible" },
   { AVC("subscribe"), OFF(Link.subscribepath), OPT_STR, 0,
   	"Stream to subscribe to" },
-  { AVC("jtv"), OFF(Link.usherToken),          OPT_STR, 0,
+  { AVC("jtv"),       OFF(Link.usherToken),    OPT_STR, 0,
 	"Justin.tv authentication token" },
+  { AVC("weeb"),      OFF(Link.WeebTicket),    OPT_STR, 0,
+	"Weeb.tv authentication token"},
   { AVC("token"),     OFF(Link.token),	       OPT_STR, 0,
   	"Key for SecureToken response" },
   { AVC("swfVfy"),    OFF(Link.lFlags),        OPT_BOOL, RTMP_LF_SWFV,
   	"Perform SWF Verification" },
   { AVC("swfAge"),    OFF(Link.swfAge),        OPT_INT, 0,
   	"Number of days to use cached SWF hash" },
+#ifdef CRYPTO
+  { AVC("swfsize"),   OFF(Link.swfSize),       OPT_INT, 0,
+  	"Size of the decompressed SWF file" },
+  { AVC("swfhash"),   OFF(Link.swfHash),       OPT_STR, 0,
+  	"SHA256 hash of the decompressed SWF file" },
+#endif
   { AVC("start"),     OFF(Link.seekTime),      OPT_INT, 0,
   	"Stream start position in milliseconds" },
   { AVC("stop"),      OFF(Link.stopTime),      OPT_INT, 0,
@@ -751,9 +767,17 @@ int RTMP_SetupURL(RTMP *r, char *url)
     }
 
 #ifdef CRYPTO
-  if ((r->Link.lFlags & RTMP_LF_SWFV) && r->Link.swfUrl.av_len)
-    RTMP_HashSWF(r->Link.swfUrl.av_val, &r->Link.SWFSize,
-	  (unsigned char *)r->Link.SWFHash, r->Link.swfAge);
+  RTMP_Log(RTMP_LOGDEBUG, "Khalsa : %d %d %s\n", r->Link.swfSize, r->Link.swfHash.av_len, r->Link.swfHash.av_val);
+  if (r->Link.swfSize && r->Link.swfHash.av_len)
+    {
+      int i, j = 0;
+      for (i = 0; i < r->Link.swfHash.av_len; i += 2)
+        r->Link.SWFHash[j++] = (HEX2BIN(r->Link.swfHash.av_val[i]) << 4) | HEX2BIN(r->Link.swfHash.av_val[i + 1]);
+      r->Link.SWFSize = (uint32_t) r->Link.swfSize;
+    }
+  else
+    if ((r->Link.lFlags & RTMP_LF_SWFV) && r->Link.swfUrl.av_len)
+      RTMP_HashSWF(r->Link.swfUrl.av_val, &r->Link.SWFSize, (unsigned char *) r->Link.SWFHash, r->Link.swfAge);
 #endif
 
   if (r->Link.port == 0)
@@ -1308,7 +1332,7 @@ ReadN(RTMP *r, char *buffer, int n)
 		  return 0;
 		}
 	    }
-	  if (r->m_resplen && !r->m_sb.sb_size)
+	  if (r->m_resplen && (!r->m_sb.sb_size))
 	    RTMPSockBuf_Fill(&r->m_sb);
           avail = r->m_sb.sb_size;
 	  if (avail > r->m_resplen)
@@ -1337,7 +1361,7 @@ ReadN(RTMP *r, char *buffer, int n)
 	  nBytes = nRead;
 	  r->m_nBytesIn += nRead;
 	  if (r->m_bSendCounter
-	      && r->m_nBytesIn > ( r->m_nBytesInSent + r->m_nClientBW / 10))
+	      && r->m_nBytesIn > (r->m_nBytesInSent + r->m_nClientBW / 10))
 	    if (!SendBytesReceived(r))
 	        return FALSE;
 	}
@@ -2318,20 +2342,17 @@ SAVC(onStatus);
 SAVC(playlist_ready);
 static const AVal av_NetStream_Failed = AVC("NetStream.Failed");
 static const AVal av_NetStream_Play_Failed = AVC("NetStream.Play.Failed");
-static const AVal av_NetStream_Play_StreamNotFound =
-AVC("NetStream.Play.StreamNotFound");
-static const AVal av_NetConnection_Connect_InvalidApp =
-AVC("NetConnection.Connect.InvalidApp");
+static const AVal av_NetStream_Play_StreamNotFound = AVC("NetStream.Play.StreamNotFound");
+static const AVal av_NetConnection_Connect_InvalidApp = AVC("NetConnection.Connect.InvalidApp");
 static const AVal av_NetStream_Play_Start = AVC("NetStream.Play.Start");
 static const AVal av_NetStream_Play_Complete = AVC("NetStream.Play.Complete");
 static const AVal av_NetStream_Play_Stop = AVC("NetStream.Play.Stop");
 static const AVal av_NetStream_Seek_Notify = AVC("NetStream.Seek.Notify");
 static const AVal av_NetStream_Pause_Notify = AVC("NetStream.Pause.Notify");
-static const AVal av_NetStream_Play_PublishNotify =
-AVC("NetStream.Play.PublishNotify");
-static const AVal av_NetStream_Play_UnpublishNotify =
-AVC("NetStream.Play.UnpublishNotify");
+static const AVal av_NetStream_Play_PublishNotify = AVC("NetStream.Play.PublishNotify");
+static const AVal av_NetStream_Play_UnpublishNotify = AVC("NetStream.Play.UnpublishNotify");
 static const AVal av_NetStream_Publish_Start = AVC("NetStream.Publish.Start");
+static const AVal av_VerifyClient = AVC("verifyClient");
 
 /* Returns 0 for OK/Failed/error, 1 for 'Stop or Complete' */
 static int
@@ -2409,10 +2430,60 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
 	      /* Authenticate on Justin.tv legacy servers before sending FCSubscribe */
 	      if (r->Link.usherToken.av_len)
 	        SendUsherToken(r, &r->Link.usherToken);
+	      /* Weeb.tv specific authentication */
+	      if (r->Link.WeebTicket.av_len)
+		{
+		  char pbuf[256], *pend = pbuf + sizeof (pbuf);
+		  char *enc = pbuf, *pstr, delim = ';';
+		  AVal av_Command, av_Ticket, av_Username, av_Password;
+
+		  AVal av_determineAccess = AVC("determineAccess");
+		  av_Ticket = r->Link.WeebTicket;
+		  pstr = r->Link.WeebTicket.av_val;
+		  if (strchr(pstr, delim) != NULL)
+		    {
+		      int len = strchr(pstr, delim) - pstr;
+		      av_Ticket.av_val = malloc(len);
+		      memcpy(av_Ticket.av_val, pstr, len);
+		      av_Ticket.av_len = len;
+		      pstr += len + 1;
+		      if (strchr(pstr, delim) != NULL)
+			{
+			  len = strchr(pstr, delim) - pstr;
+			  av_Username.av_val = malloc(len);
+			  memcpy(av_Username.av_val, pstr, len);
+			  av_Username.av_len = len;
+			  pstr += len + 1;
+			  len = r->Link.WeebTicket.av_len - (pstr - r->Link.WeebTicket.av_val);
+			  av_Password.av_val = malloc(len);
+			  memcpy(av_Password.av_val, pstr, len);
+			  av_Password.av_len = len;
+			}
+		      else
+			{
+			  len = r->Link.WeebTicket.av_len - (pstr - r->Link.WeebTicket.av_val);
+			  av_Username.av_val = malloc(len);
+			  memcpy(av_Username.av_val, pstr, len);
+			  av_Username.av_len = len;
+			}
+		    }
+
+		  enc = AMF_EncodeString(enc, pend, &av_determineAccess);
+		  enc = AMF_EncodeNumber(enc, pend, 0);
+		  *enc++ = AMF_NULL;
+		  enc = AMF_EncodeString(enc, pend, &av_Ticket);
+		  enc = AMF_EncodeString(enc, pend, &av_Username);
+		  enc = AMF_EncodeString(enc, pend, &av_Password);
+		  av_Command.av_val = pbuf;
+		  av_Command.av_len = enc - pbuf;
+
+		  RTMP_Log(RTMP_LOGDEBUG, "WeebTicket: %s", r->Link.WeebTicket.av_val);
+		  SendCustomCommand(r, &av_Command);
+		}
 	      /* Send the FCSubscribe if live stream or if subscribepath is set */
 	      if (r->Link.subscribepath.av_len)
 	        SendFCSubscribe(r, &r->Link.subscribepath);
-	      else if (r->Link.lFlags & RTMP_LF_LIVE)
+	      else if ((r->Link.lFlags & RTMP_LF_LIVE) && (!r->Link.WeebTicket.av_len))
 	        SendFCSubscribe(r, &r->Link.playpath);
 	    }
 	}
@@ -2562,6 +2633,26 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
 	      break;
 	    }
         }
+    }
+  else if (AVMATCH(&method, &av_VerifyClient))
+    {
+      char pbuf[256], *pend = pbuf + sizeof (pbuf);
+      char *enc = pbuf;
+      AVal av_Response;
+
+      double VerificationNumber = AMFProp_GetNumber(AMF_GetProp(&obj, NULL, 3));
+      RTMP_Log(RTMP_LOGDEBUG, "VerificationNumber : %.2f", VerificationNumber);
+
+      enc = AMF_EncodeString(enc, pend, &av__result);
+      enc = AMF_EncodeNumber(enc, pend, AMFProp_GetNumber(AMF_GetProp(&obj, NULL, 1)));
+      *enc++ = AMF_NULL;
+      enc = AMF_EncodeNumber(enc, pend, exp(atan(sqrt(VerificationNumber))) + 1);
+      av_Response.av_val = pbuf;
+      av_Response.av_len = enc - pbuf;
+
+      AMF_Decode(&obj, av_Response.av_val, av_Response.av_len, FALSE);
+      AMF_Dump(&obj);
+      SendCustomCommand(r, &av_Response);
     }
   else
     {
@@ -2857,14 +2948,14 @@ HandleCtrl(RTMP *r, const RTMPPacket *packet)
       if (packet->m_nBodySize > 2 && packet->m_body[2] > 0x01)
 	{
 	  RTMP_Log(RTMP_LOGERROR,
-            "%s: SWFVerification Type %d request not supported! Patches welcome...",
+		  "%s: SWFVerification Type %d request not supported, attempting to use SWFVerification Type 1! Patches welcome...",
 	    __FUNCTION__, packet->m_body[2]);
 	}
 #ifdef CRYPTO
       /*RTMP_LogHex(packet.m_body, packet.m_nBodySize); */
 
       /* respond with HMAC SHA256 of decompressed SWF, key is the 30byte player key, also the last 30 bytes of the server handshake are applied */
-      else if (r->Link.SWFSize)
+      if (r->Link.SWFSize)
 	{
 	  RTMP_SendCtrl(r, 0x1B, 0, 0);
 	}
@@ -3749,6 +3840,14 @@ HTTP_read(RTMP *r, int fill)
   if (!ptr)
     return -1;
   ptr += 4;
+  int ContentLength = r->m_sb.sb_size - (ptr - r->m_sb.sb_start);
+  if (ContentLength < 3584)
+    while (ContentLength < hlen)
+      {
+	if (!RTMPSockBuf_Fill(&r->m_sb))
+	  return -1;
+	ContentLength = r->m_sb.sb_size - (ptr - r->m_sb.sb_start);
+      }
   r->m_sb.sb_size -= ptr - r->m_sb.sb_start;
   r->m_sb.sb_start = ptr;
   r->m_unackd--;
@@ -4457,4 +4556,33 @@ RTMP_Write(RTMP *r, const char *buf, int size)
 	}
     }
   return size+s2;
+}
+
+static int
+SendCustomCommand(RTMP *r, AVal *Command)
+{
+  RTMPPacket packet;
+  char pbuf[512];
+  char *enc;
+
+  packet.m_nChannel = 0x03; /* control channel (invoke) */
+  packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+  packet.m_packetType = RTMP_PACKET_TYPE_INVOKE;
+  packet.m_nTimeStamp = 0;
+  packet.m_nInfoField2 = 0;
+  packet.m_hasAbsTimestamp = 0;
+  packet.m_body = pbuf + RTMP_MAX_HEADER_SIZE;
+
+  enc = packet.m_body;
+  if (Command->av_len)
+    {
+      memcpy(enc, Command->av_val, Command->av_len);
+      enc += Command->av_len;
+    }
+  if (!enc)
+    return FALSE;
+
+  packet.m_nBodySize = enc - packet.m_body;
+
+  return RTMP_SendPacket(r, &packet, FALSE);
 }
